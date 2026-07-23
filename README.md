@@ -20,6 +20,10 @@ CARGO TRUCK APP is a worldwide direct freight marketplace for shippers, trucking
 - Atomic file-backed development persistence adapter
 - Authorized shipment state machine from award through close
 - Tamper-evident document metadata and carrier GPS events
+- Document quarantine with explicit scan-result review
+- GPS chronology and implausible-speed rejection
+- Idempotent payment authorization with two-person approval
+- Fail-closed production-readiness reporting
 
 ## Run
 
@@ -61,3 +65,9 @@ Shipment APIs:
 - `POST /api/shipments/:id/transition`
 - `POST /api/shipments/:id/documents`
 - `POST /api/shipments/:id/tracking`
+- `POST /api/shipments/:id/documents/:documentId/scan-review`
+- `POST /api/shipments/:id/payment-authorizations` — requires `Idempotency-Key`
+- `POST /api/payment-authorizations/:id/approve` — requires a different authorized shipper identity
+- `GET /api/readiness` — returns HTTP 503 until every production control is configured
+
+Payment authorization only records approval for a future processor. It never moves funds. Production settlement requires an approved payment provider, webhook signature validation, reconciliation, dispute controls, and country-specific licensing review.

@@ -5,6 +5,7 @@ const { calculateTripEconomics, rankLoads } = require("./src/marketplace");
 const { createMemoryStore } = require("./src/workflow");
 const { actorFromRequest, createSession } = require("./src/auth");
 const { createJsonPersistence } = require("./src/persistence");
+const { productionReadiness } = require("./src/readiness");
 
 const publicDir = path.join(__dirname, "public");
 const demoLoads = [
@@ -34,6 +35,10 @@ async function readJson(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   if (req.url === "/api/health") return json(res, 200, { status: "ok", product: "CARGO TRUCK APP" });
+  if (req.url === "/api/readiness") {
+    const readiness = productionReadiness();
+    return json(res, readiness.ready ? 200 : 503, readiness);
+  }
   if (req.url === "/api/config") return json(res, 200, {
     mapsEnabled: process.env.MAPS_ENABLED === "true" && Boolean(process.env.GOOGLE_MAPS_API_KEY),
     mapId: process.env.GOOGLE_MAPS_MAP_ID || null,
@@ -84,9 +89,25 @@ const server = http.createServer(async (req, res) => {
     if (documentRoute && req.method === "POST") {
       return json(res, 201, { document: store.addDocument(documentRoute[1], await readJson(req), actorId) });
     }
+    const scanRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/documents\/([^/]+)\/scan-review$/);
+    if (scanRoute && req.method === "POST") {
+      return json(res, 200, { document: store.recordDocumentScan(scanRoute[1], scanRoute[2], await readJson(req), actorId) });
+    }
     const trackingRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/tracking$/);
     if (trackingRoute && req.method === "POST") {
       return json(res, 201, { event: store.addTrackingEvent(trackingRoute[1], await readJson(req), actorId) });
+    }
+    const paymentRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/payment-authorizations$/);
+    if (paymentRoute && req.method === "POST") {
+      const key = req.headers["idempotency-key"];
+      return json(res, 201, {
+        authorization: store.requestPaymentAuthorization(paymentRoute[1], await readJson(req), actorId, key)
+      });
+    }
+    const approvalRoute = url.pathname.match(/^\/api\/payment-authorizations\/([^/]+)\/approve$/);
+    if (approvalRoute && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, { authorization: store.approvePaymentAuthorization(approvalRoute[1], actorId, body) });
     }
   } catch (error) {
     const status = error instanceof TypeError ? 400 : /authentication|session/i.test(error.message) ? 401 :

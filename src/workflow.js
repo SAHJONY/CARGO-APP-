@@ -19,6 +19,8 @@ function createMemoryStore(seedLoads = [], options = {}) {
     companies: new Map(),
     loads: new Map(seedLoads.map(load => [load.id, { ...load, bids: [], status: "open" }])),
     shipments: new Map(),
+    paymentAuthorizations: new Map(),
+    idempotency: new Map(),
     audit: []
   };
   const persist = typeof options.persist === "function" ? options.persist : () => {};
@@ -28,8 +30,18 @@ function createMemoryStore(seedLoads = [], options = {}) {
       companies: [...state.companies.values()],
       loads: [...state.loads.values()],
       shipments: [...state.shipments.values()],
+      paymentAuthorizations: [...state.paymentAuthorizations.values()],
       audit: state.audit
     });
+  }
+
+  function idempotent(scope, actorId, key, action) {
+    const normalized = requiredString(key, "idempotencyKey", 128);
+    const cacheKey = `${scope}:${actorId}:${normalized}`;
+    if (state.idempotency.has(cacheKey)) return state.idempotency.get(cacheKey);
+    const result = action();
+    state.idempotency.set(cacheKey, result);
+    return result;
   }
 
   function record(action, actorId, targetId, detail = {}) {
@@ -192,12 +204,28 @@ function createMemoryStore(seedLoads = [], options = {}) {
       fileName: requiredString(input.fileName, "fileName"),
       sha256: requiredString(input.sha256, "sha256", 64).toLowerCase(),
       uploadedBy: actorId,
-      status: "metadata_recorded",
+      status: "quarantined",
       createdAt: new Date().toISOString()
     };
     if (!/^[a-f0-9]{64}$/.test(document.sha256)) throw new TypeError("sha256 must be a 64-character hex digest");
     shipment.documents.push(document);
     record("document.recorded", actorId, id, { documentId: document.id, type });
+    return document;
+  }
+
+  function recordDocumentScan(id, documentId, input, actorId) {
+    const shipment = shipmentFor(id);
+    requireParty(shipment, actorId);
+    const actor = state.companies.get(actorId);
+    if (actor.role !== "shipper") throw new Error("Only the shipper can approve a document scan result");
+    const document = shipment.documents.find(item => item.id === documentId);
+    if (!document) throw new Error("Document not found");
+    const result = requiredString(input.result, "result");
+    if (!["clean", "rejected"].includes(result)) throw new TypeError("scan result is not supported");
+    if (input.approval !== "APPROVE") throw new Error("Explicit human approval is required");
+    document.status = result === "clean" ? "available" : "rejected";
+    document.scannedAt = new Date().toISOString();
+    record("document.scan_reviewed", actorId, id, { documentId, result });
     return document;
   }
 
@@ -215,15 +243,72 @@ function createMemoryStore(seedLoads = [], options = {}) {
       recordedAt: input.recordedAt ? requiredString(input.recordedAt, "recordedAt") : new Date().toISOString(),
       source: "carrier_device"
     };
+    const recordedAtMs = Date.parse(event.recordedAt);
+    if (!Number.isFinite(recordedAtMs)) throw new TypeError("recordedAt is invalid");
+    const previous = shipment.tracking.at(-1);
+    if (previous) {
+      const elapsedHours = (recordedAtMs - Date.parse(previous.recordedAt)) / 3_600_000;
+      if (elapsedHours <= 0) throw new TypeError("tracking events must be chronological");
+      const distanceKm = haversineKm(previous.latitude, previous.longitude, latitude, longitude);
+      if (distanceKm / elapsedHours > 160) throw new Error("Tracking update exceeds plausible truck speed");
+    }
     shipment.tracking.push(event);
     record("tracking.recorded", actorId, id, { trackingId: event.id });
     return event;
   }
 
+  function requestPaymentAuthorization(id, input, actorId, idempotencyKey) {
+    const shipment = shipmentFor(id);
+    if (actorId !== shipment.shipperId) throw new Error("Only the shipper can request payment authorization");
+    if (shipment.status !== "pod_approved") throw new Error("Approved proof of delivery is required before payment authorization");
+    return idempotent(`payment:${id}`, actorId, idempotencyKey, () => {
+      const authorization = {
+        id: `PAY-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+        shipmentId: id,
+        amount: positiveNumber(input.amount, "amount"),
+        currency: requiredString(input.currency, "currency", 3).toUpperCase(),
+        status: "pending_approval",
+        requestedBy: actorId,
+        requestedByUser: requiredString(input.requestedByUser, "requestedByUser", 128),
+        createdAt: new Date().toISOString()
+      };
+      state.paymentAuthorizations.set(authorization.id, authorization);
+      record("payment.authorization_requested", actorId, id, { paymentAuthorizationId: authorization.id });
+      return authorization;
+    });
+  }
+
+  function approvePaymentAuthorization(id, actorId, input) {
+    const authorization = state.paymentAuthorizations.get(id);
+    if (!authorization) throw new Error("Payment authorization not found");
+    const shipment = shipmentFor(authorization.shipmentId);
+    if (actorId !== shipment.shipperId) throw new Error("Only the shipper can approve payment authorization");
+    if (input.approval !== "APPROVE") throw new Error("Explicit human approval is required");
+    const approverUser = requiredString(input.approverUser, "approverUser", 128);
+    if (authorization.requestedByUser === approverUser) throw new Error("A different authorized person must approve payment");
+    authorization.status = "approved_for_processor";
+    authorization.approvedBy = actorId;
+    authorization.approvedByUser = approverUser;
+    authorization.approvedAt = new Date().toISOString();
+    record("payment.authorization_approved", actorId, shipment.id, { paymentAuthorizationId: id });
+    return authorization;
+  }
+
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    const radians = value => value * Math.PI / 180;
+    const dLat = radians(lat2 - lat1);
+    const dLon = radians(lon2 - lon1);
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(radians(lat1)) * Math.cos(radians(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
   return {
-    state, onboardCompany, postLoad, submitBid, acceptBid, transitionShipment, addDocument, addTrackingEvent,
+    state, onboardCompany, postLoad, submitBid, acceptBid, transitionShipment, addDocument, recordDocumentScan,
+    addTrackingEvent, requestPaymentAuthorization, approvePaymentAuthorization,
     listLoads: () => [...state.loads.values()],
     listShipments: () => [...state.shipments.values()],
+    listPaymentAuthorizations: () => [...state.paymentAuthorizations.values()],
     listAudit: () => [...state.audit]
   };
 }
