@@ -1,0 +1,66 @@
+.button {
+  border-radius: 4px;
+  padding: 13px 20px;
+  font-weight: 800;
+  display: inline-block;
+}
+
+.command {
+  padding: 80px 7vw;
+  background: #e7eae3;
+  display: grid;
+  grid-template-columns: 0.7fr 1.3fr;
+  gap: 7vw;
+}
+
+.command h2 {
+  font-size: 42px;
+  margin: 5px 0 18px;
+}
+
+.command > div > p:last-child,
+.workflow-grid p {
+  color: var(--muted);
+}
+
+.workflow-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.workflow-grid article {
+  background: var(--paper);
+  padding: 24px;
+  border: 1px solid var(--line);
+}
+
+.workflow-grid span {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--lime);
+  font-weight: 900;
+}
+
+.workflow-grid h3 {
+  margin: 18px 0 6px;
+}
+
+@media (max-width: 850px) {
+  .command {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .command {
+    padding: 60px 5vw;
+  }
+
+  .workflow-grid {
+    grid-template-columns: 1fr;
+  }
+}
