@@ -16,6 +16,10 @@ CARGO TRUCK APP is a worldwide direct freight marketplace for shippers, trucking
 - Validated company onboarding for five marketplace roles
 - Direct load posting, carrier bidding, and shipper-controlled awards
 - Append-only in-process audit events for consequential actions
+- Signed bearer sessions with production fail-closed development login
+- Atomic file-backed development persistence adapter
+- Authorized shipment state machine from award through close
+- Tamper-evident document metadata and carrier GPS events
 
 ## Run
 
@@ -49,4 +53,11 @@ No autonomous acceptance of contracts, load assignment, payments, regulated comp
 - `POST /api/loads/:id/bids/:bidId/accept` — award with explicit `APPROVE`
 - `GET /api/audit` — inspect workflow events
 
-Write requests use `X-Actor-Id` in this development slice. Production must replace it with authenticated sessions, authorization policies, durable storage, idempotency keys, and external verification providers.
+Use `POST /api/sessions` in development to exchange an onboarded company ID for a signed bearer token. This endpoint is disabled when `NODE_ENV=production`. Production must integrate an external identity provider, PostgreSQL, object storage, idempotency keys, and external verification providers.
+
+Shipment APIs:
+
+- `GET /api/shipments`
+- `POST /api/shipments/:id/transition`
+- `POST /api/shipments/:id/documents`
+- `POST /api/shipments/:id/tracking`
