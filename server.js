@@ -3,6 +3,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { calculateTripEconomics, rankLoads } = require("./src/marketplace");
 const { createMemoryStore } = require("./src/workflow");
+const { actorFromRequest, createSession } = require("./src/auth");
+const { createJsonPersistence } = require("./src/persistence");
 
 const publicDir = path.join(__dirname, "public");
 const demoLoads = [
@@ -10,7 +12,9 @@ const demoLoads = [
   { id: "CTA-1043", origin: "Monterrey, MX", destination: "Laredo, US", distanceKm: 230, rate: 980, currency: "USD", equipment: "Reefer", deadheadKm: 18, verified: true },
   { id: "CTA-1044", origin: "Rotterdam, NL", destination: "Düsseldorf, DE", distanceKm: 226, rate: 760, currency: "EUR", equipment: "Container", deadheadKm: 11, verified: true }
 ];
-const store = createMemoryStore(demoLoads);
+const persistence = process.env.DATA_FILE ? createJsonPersistence(process.env.DATA_FILE) : undefined;
+const store = createMemoryStore(demoLoads, { persist: persistence });
+const sessionSecret = process.env.SESSION_SECRET || "development-only-secret-change-me-123";
 
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -29,7 +33,6 @@ async function readJson(req) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
-  const actorId = req.headers["x-actor-id"];
   if (req.url === "/api/health") return json(res, 200, { status: "ok", product: "CARGO TRUCK APP" });
   if (req.url === "/api/config") return json(res, 200, {
     mapsEnabled: process.env.MAPS_ENABLED === "true" && Boolean(process.env.GOOGLE_MAPS_API_KEY),
@@ -47,6 +50,13 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/companies" && req.method === "POST") {
       return json(res, 201, { company: store.onboardCompany(await readJson(req)) });
     }
+    if (url.pathname === "/api/sessions" && req.method === "POST") {
+      if (process.env.NODE_ENV === "production") throw new Error("Development sessions are disabled in production");
+      const body = await readJson(req);
+      if (!store.state.companies.has(body.actorId)) throw new Error("Company not found");
+      return json(res, 201, { token: createSession(body.actorId, sessionSecret) });
+    }
+    const actorId = url.pathname.startsWith("/api/") ? actorFromRequest(req, sessionSecret) : null;
     if (url.pathname === "/api/loads" && req.method === "POST") {
       return json(res, 201, { load: store.postLoad(await readJson(req), actorId) });
     }
@@ -62,8 +72,25 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/audit" && req.method === "GET") {
       return json(res, 200, { events: store.listAudit() });
     }
+    if (url.pathname === "/api/shipments" && req.method === "GET") {
+      return json(res, 200, { shipments: store.listShipments().filter(item => [item.shipperId, item.carrierId].includes(actorId)) });
+    }
+    const transitionRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/transition$/);
+    if (transitionRoute && req.method === "POST") {
+      const body = await readJson(req);
+      return json(res, 200, { shipment: store.transitionShipment(transitionRoute[1], body.status, actorId, body.approval) });
+    }
+    const documentRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/documents$/);
+    if (documentRoute && req.method === "POST") {
+      return json(res, 201, { document: store.addDocument(documentRoute[1], await readJson(req), actorId) });
+    }
+    const trackingRoute = url.pathname.match(/^\/api\/shipments\/([^/]+)\/tracking$/);
+    if (trackingRoute && req.method === "POST") {
+      return json(res, 201, { event: store.addTrackingEvent(trackingRoute[1], await readJson(req), actorId) });
+    }
   } catch (error) {
-    const status = error instanceof TypeError ? 400 : /not found/i.test(error.message) ? 404 : 409;
+    const status = error instanceof TypeError ? 400 : /authentication|session/i.test(error.message) ? 401 :
+      /authorized|only the/i.test(error.message) ? 403 : /not found/i.test(error.message) ? 404 : 409;
     return json(res, status, { error: error.message });
   }
 
