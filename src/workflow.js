@@ -14,16 +14,28 @@ function positiveNumber(value, field) {
   return value;
 }
 
-function createMemoryStore(seedLoads = []) {
+function createMemoryStore(seedLoads = [], options = {}) {
   const state = {
     companies: new Map(),
     loads: new Map(seedLoads.map(load => [load.id, { ...load, bids: [], status: "open" }])),
+    shipments: new Map(),
     audit: []
   };
+  const persist = typeof options.persist === "function" ? options.persist : () => {};
+
+  function save() {
+    persist({
+      companies: [...state.companies.values()],
+      loads: [...state.loads.values()],
+      shipments: [...state.shipments.values()],
+      audit: state.audit
+    });
+  }
 
   function record(action, actorId, targetId, detail = {}) {
     const event = { id: crypto.randomUUID(), action, actorId, targetId, detail, at: new Date().toISOString() };
     state.audit.push(event);
+    save();
     return event;
   }
 
@@ -108,13 +120,110 @@ function createMemoryStore(seedLoads = []) {
     bid.status = "accepted";
     load.status = "awarded";
     load.assignment = { bidId, carrierId: bid.bidderId, approvedBy: actorId, approvedAt: new Date().toISOString() };
-    record("bid.accepted", actorId, loadId, { bidId, carrierId: bid.bidderId });
+    const shipment = {
+      id: `SHP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+      loadId,
+      shipperId: load.shipperId,
+      carrierId: bid.bidderId,
+      status: "awarded",
+      documents: [],
+      tracking: [],
+      createdAt: new Date().toISOString()
+    };
+    state.shipments.set(shipment.id, shipment);
+    load.shipmentId = shipment.id;
+    record("bid.accepted", actorId, loadId, { bidId, carrierId: bid.bidderId, shipmentId: shipment.id });
     return load;
   }
 
+  function shipmentFor(id) {
+    const shipment = state.shipments.get(id);
+    if (!shipment) throw new Error("Shipment not found");
+    return shipment;
+  }
+
+  function requireParty(shipment, actorId) {
+    const actor = state.companies.get(actorId);
+    if (!actor || ![shipment.shipperId, shipment.carrierId].includes(actorId)) {
+      throw new Error("Actor is not authorized for this shipment");
+    }
+    return actor;
+  }
+
+  function transitionShipment(id, nextStatus, actorId, approval) {
+    const shipment = shipmentFor(id);
+    const actor = requireParty(shipment, actorId);
+    const transitions = {
+      awarded: ["dispatched"],
+      dispatched: ["picked_up"],
+      picked_up: ["in_transit"],
+      in_transit: ["delivered"],
+      delivered: ["pod_approved"],
+      pod_approved: ["closed"]
+    };
+    if (!transitions[shipment.status]?.includes(nextStatus)) throw new Error("Invalid shipment transition");
+    if (["dispatched", "picked_up", "in_transit", "delivered"].includes(nextStatus) && actorId !== shipment.carrierId) {
+      throw new Error("Only the assigned carrier can perform this transition");
+    }
+    if (["pod_approved", "closed"].includes(nextStatus) && actorId !== shipment.shipperId) {
+      throw new Error("Only the shipper can approve delivery or close the shipment");
+    }
+    if (["pod_approved", "closed"].includes(nextStatus) && approval !== "APPROVE") {
+      throw new Error("Explicit human approval is required");
+    }
+    if (nextStatus === "pod_approved" && !shipment.documents.some(item => item.type === "proof_of_delivery")) {
+      throw new Error("Proof of delivery is required");
+    }
+    shipment.status = nextStatus;
+    shipment.updatedAt = new Date().toISOString();
+    record("shipment.transitioned", actor.id, id, { status: nextStatus });
+    return shipment;
+  }
+
+  function addDocument(id, input, actorId) {
+    const shipment = shipmentFor(id);
+    requireParty(shipment, actorId);
+    const allowed = new Set(["bill_of_lading", "commercial_invoice", "customs", "inspection", "proof_of_delivery"]);
+    const type = requiredString(input.type, "type");
+    if (!allowed.has(type)) throw new TypeError("document type is not supported");
+    const document = {
+      id: `DOC-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+      type,
+      fileName: requiredString(input.fileName, "fileName"),
+      sha256: requiredString(input.sha256, "sha256", 64).toLowerCase(),
+      uploadedBy: actorId,
+      status: "metadata_recorded",
+      createdAt: new Date().toISOString()
+    };
+    if (!/^[a-f0-9]{64}$/.test(document.sha256)) throw new TypeError("sha256 must be a 64-character hex digest");
+    shipment.documents.push(document);
+    record("document.recorded", actorId, id, { documentId: document.id, type });
+    return document;
+  }
+
+  function addTrackingEvent(id, input, actorId) {
+    const shipment = shipmentFor(id);
+    if (actorId !== shipment.carrierId) throw new Error("Only the assigned carrier can report location");
+    const latitude = Number(input.latitude);
+    const longitude = Number(input.longitude);
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) throw new TypeError("latitude is invalid");
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) throw new TypeError("longitude is invalid");
+    const event = {
+      id: `TRK-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+      latitude,
+      longitude,
+      recordedAt: input.recordedAt ? requiredString(input.recordedAt, "recordedAt") : new Date().toISOString(),
+      source: "carrier_device"
+    };
+    shipment.tracking.push(event);
+    record("tracking.recorded", actorId, id, { trackingId: event.id });
+    return event;
+  }
+
   return {
-    state, onboardCompany, postLoad, submitBid, acceptBid,
+    state, onboardCompany, postLoad, submitBid, acceptBid, transitionShipment, addDocument, addTrackingEvent,
     listLoads: () => [...state.loads.values()],
+    listShipments: () => [...state.shipments.values()],
     listAudit: () => [...state.audit]
   };
 }
