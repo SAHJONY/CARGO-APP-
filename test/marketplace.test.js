@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { calculateTripEconomics, rankLoads, canAssignLoad } = require("../src/marketplace");
 const { createMemoryStore } = require("../src/workflow");
+const { createSession, verifySession } = require("../src/auth");
 
 test("calculates transparent trip economics", () => {
   const result = calculateTripEconomics({
@@ -60,4 +61,55 @@ test("rejects unauthorized load posting", () => {
   const store = createMemoryStore();
   const carrier = store.onboardCompany({ legalName: "Road One", countryCode: "CA", role: "carrier" });
   assert.throws(() => store.postLoad({ rate: -1 }, carrier.id), /Only an onboarded shipper/);
+});
+
+function awardedShipment() {
+  const store = createMemoryStore();
+  const shipper = store.onboardCompany({ legalName: "Global Foods", countryCode: "US", role: "shipper" });
+  const carrier = store.onboardCompany({ legalName: "Road One", countryCode: "CA", role: "carrier" });
+  carrier.verification = { identity: "verified", authority: "verified", insurance: "verified", sanctions: "clear" };
+  const load = store.postLoad({
+    origin: "Chicago, US", destination: "Toronto, CA", distanceKm: 837,
+    rate: 2450, currency: "USD", equipment: "Dry Van", pickupAt: "2026-08-01T10:00:00Z"
+  }, shipper.id);
+  const bid = store.submitBid(load.id, { amount: 2300, currency: "USD" }, carrier.id);
+  store.acceptBid(load.id, bid.id, shipper.id, "APPROVE");
+  return { store, shipper, carrier, shipment: store.listShipments()[0] };
+}
+
+test("signs and verifies expiring actor sessions", () => {
+  const secret = "a-secure-test-secret-with-32-characters";
+  const token = createSession("ORG-123", secret);
+  assert.equal(verifySession(token, secret).sub, "ORG-123");
+  assert.throws(() => verifySession(`${token}x`, secret), /Invalid session/);
+});
+
+test("enforces shipment parties and ordered transitions", () => {
+  const { store, shipper, carrier, shipment } = awardedShipment();
+  assert.throws(() => store.transitionShipment(shipment.id, "delivered", carrier.id), /Invalid shipment transition/);
+  store.transitionShipment(shipment.id, "dispatched", carrier.id);
+  store.transitionShipment(shipment.id, "picked_up", carrier.id);
+  store.transitionShipment(shipment.id, "in_transit", carrier.id);
+  store.transitionShipment(shipment.id, "delivered", carrier.id);
+  assert.throws(() => store.transitionShipment(shipment.id, "pod_approved", shipper.id, "APPROVE"), /Proof of delivery/);
+});
+
+test("records tamper-evident POD metadata before shipper approval", () => {
+  const { store, shipper, carrier, shipment } = awardedShipment();
+  for (const status of ["dispatched", "picked_up", "in_transit", "delivered"]) {
+    store.transitionShipment(shipment.id, status, carrier.id);
+  }
+  store.addDocument(shipment.id, {
+    type: "proof_of_delivery",
+    fileName: "pod.pdf",
+    sha256: "a".repeat(64)
+  }, carrier.id);
+  assert.equal(store.transitionShipment(shipment.id, "pod_approved", shipper.id, "APPROVE").status, "pod_approved");
+});
+
+test("accepts carrier tracking and rejects invalid coordinates", () => {
+  const { store, shipper, carrier, shipment } = awardedShipment();
+  assert.throws(() => store.addTrackingEvent(shipment.id, { latitude: 91, longitude: 1 }, carrier.id), /latitude/);
+  assert.throws(() => store.addTrackingEvent(shipment.id, { latitude: 41, longitude: -87 }, shipper.id), /assigned carrier/);
+  assert.equal(store.addTrackingEvent(shipment.id, { latitude: 41.88, longitude: -87.63 }, carrier.id).source, "carrier_device");
 });
